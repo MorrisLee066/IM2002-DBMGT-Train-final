@@ -3,7 +3,7 @@
 A practical guide for three students working together on TransitFlow using any AI coding assistant (Claude Code, GitHub Copilot, Cursor, Gemini Code Assist, etc.).
 
 **Read this before you write a single line of code.**
-Jean
+Jean Jean Jean
 ---
 
 ## Table of Contents
