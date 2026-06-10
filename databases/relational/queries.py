@@ -141,23 +141,36 @@ def query_metro_fare(schedule_id: str, stops_travelled: int) -> Optional[dict]:
 
 # ── SEAT SELECTION ────────────────────────────────────────────────────────────
 
-def query_available_seats(
-    schedule_id: str,
-    travel_date: str,
-    fare_class: str,
-) -> list[dict]:
+def query_available_seats(schedule_id: str, travel_date: str, fare_class: str) -> list[dict]:
     """
-    Return available seats for a national rail journey on a given date.
-
-    Args:
-        schedule_id:  e.g. "NR_SCH01"
-        travel_date:  e.g. "2025-06-01"
-        fare_class:   "standard" or "first"
-
-    Returns:
-        List of dicts: {seat_id, coach, row, column}
+    Calculates real-time seat availability for a specific train and date.
+    Uses NOT EXISTS subquery to filter out seats that are currently booked.
     """
-    raise NotImplementedError("TODO: implement after designing your schema")
+    try:
+        with _connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # Note: schedule_id passed by Agent is the schedule_code (Business Key, e.g., 'NR1-001')
+                cur.execute("""
+                    SELECT s.seat_code, s.coach, s.seat_row, s.seat_column
+                    FROM national_rail_seats s
+                    JOIN national_rail_schedules sch ON s.schedule_id = sch.id
+                    WHERE sch.schedule_code = %s AND s.fare_class = %s
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM national_rail_bookings b
+                          WHERE b.schedule_id = sch.id
+                            AND b.travel_date = %s::DATE
+                            AND b.seat_code = s.seat_code
+                            AND b.status IN ('confirmed', 'in_transit')
+                      )
+                    ORDER BY s.coach, s.seat_row, s.seat_column
+                """, (schedule_id, fare_class, travel_date))
+                
+                return [dict(row) for row in cur.fetchall()]
+                
+    except Exception as e:
+        logging.error(f"Database error in query_available_seats: {e}")
+        return []
 
 
 def auto_select_adjacent_seats(available_seats: list[dict], count: int) -> list[str]:
@@ -187,26 +200,104 @@ def auto_select_adjacent_seats(available_seats: list[dict], count: int) -> list[
     return [s["seat_id"] for s in sorted_seats[:count]]
 
 
-# ── USER & BOOKING QUERIES ────────────────────────────────────────────────────
+# ── SEAT & USER QUERIES (Task 2b) ─────────────────────────────────────────────
 
 def query_user_profile(user_email: str) -> Optional[dict]:
-    """Return a user's profile by email."""
-    raise NotImplementedError("TODO: implement after designing your schema")
+    """
+    Retrieves the user's profile information.
+    Enforces Soft Delete (is_active) check to ensure deactivated users are not queried.
+    """
+    try:
+        with _connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # Parameterized Query to prevent SQL Injection
+                cur.execute("""
+                    SELECT user_code, full_name, first_name, surname, email, phone, date_of_birth, year_of_birth, registered_at
+                    FROM users
+                    WHERE email = %s AND is_active = TRUE
+                """, (user_email,))
+                
+                row = cur.fetchone()
+                return dict(row) if row else None
+    except Exception as e:
+        logging.error(f"Database error in query_user_profile: {e}")
+        return None
 
 
 def query_user_bookings(user_email: str) -> dict:
     """
-    Return a user's combined booking history (national rail + metro).
-
-    Returns:
-        dict with keys 'national_rail' (list) and 'metro' (list)
+    Retrieves all bookings (both national rail and metro) for a specific user.
+    Demonstrates advanced Relational JOINs across multiple tables.
     """
-    raise NotImplementedError("TODO: implement after designing your schema")
+    result = {"national_rail": [], "metro": []}
+    try:
+        with _connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # Step 1: Resolve the user's UUID securely
+                cur.execute("SELECT id FROM users WHERE email = %s AND is_active = TRUE", (user_email,))
+                user = cur.fetchone()
+                if not user:
+                    return result
+                
+                user_id = user["id"]
+
+                # Step 2: Fetch National Rail Bookings with Station Names (JOIN)
+                cur.execute("""
+                    SELECT b.booking_ref, b.travel_date, b.departure_time, b.ticket_type, b.fare_class,
+                           b.coach, b.seat_code, b.amount_usd, b.status,
+                           o.name AS origin_station, d.name AS destination_station
+                    FROM national_rail_bookings b
+                    JOIN national_rail_stations o ON b.origin_station_id = o.id
+                    JOIN national_rail_stations d ON b.destination_station_id = d.id
+                    WHERE b.user_id = %s
+                    ORDER BY b.travel_date DESC, b.departure_time DESC
+                """, (user_id,))
+                result["national_rail"] = [dict(r) for r in cur.fetchall()]
+
+                # Step 3: Fetch Metro Trips with Station Names (JOIN)
+                cur.execute("""
+                    SELECT m.trip_ref, m.travel_date, m.ticket_type, m.amount_usd, m.status,
+                           o.name AS origin_station, d.name AS destination_station
+                    FROM metro_trips m
+                    LEFT JOIN metro_stations o ON m.origin_station_id = o.id
+                    LEFT JOIN metro_stations d ON m.destination_station_id = d.id
+                    WHERE m.user_id = %s
+                    ORDER BY m.travel_date DESC
+                """, (user_id,))
+                result["metro"] = [dict(r) for r in cur.fetchall()]
+
+        return result
+        
+    except Exception as e:
+        # Fallback to empty structure to prevent UI/Agent crashes
+        logging.error(f"Database error in query_user_bookings: {e}")
+        return {"national_rail": [], "metro": []}
 
 
 def query_payment_info(booking_id: str) -> Optional[dict]:
-    """Return payment record for a booking or metro trip."""
-    raise NotImplementedError("TODO: implement after designing your schema")
+    """
+    Retrieves payment info for a given booking reference.
+    Demonstrates handling of Polymorphic Associations (rail_booking vs metro_trip).
+    """
+    try:
+        with _connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # We assume booking_id from the LLM Agent refers to the Business Key (e.g., 'BKG-123')
+                # We check both rail bookings and metro trips.
+                cur.execute("""
+                    SELECT p.payment_ref, p.amount_usd, p.method, p.status, p.paid_at
+                    FROM payments p
+                    LEFT JOIN national_rail_bookings rb ON p.rail_booking_id = rb.id
+                    LEFT JOIN metro_trips mt ON p.metro_trip_id = mt.id
+                    WHERE rb.booking_ref = %s OR mt.trip_ref = %s
+                """, (booking_id, booking_id))
+                
+                row = cur.fetchone()
+                return dict(row) if row else None
+                
+    except Exception as e:
+        logging.error(f"Database error in query_payment_info: {e}")
+        return None
 
 
 # ── TRANSACTIONAL OPERATIONS ──────────────────────────────────────────────────
