@@ -25,13 +25,20 @@ from __future__ import annotations
 import json
 import random
 import string
+import uuid
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 
 import psycopg2
 import psycopg2.extras
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
 
 from skeleton.config import PG_DSN, VECTOR_TOP_K, VECTOR_SIMILARITY_THRESHOLD
+
+# 全域 Argon2 實例
+ph = PasswordHasher()
 
 
 def _connect():
@@ -256,45 +263,229 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
 # ── AUTHENTICATION QUERIES ────────────────────────────────────────────────────
 
 def register_user(
-    email: str,
-    first_name: str,
-    surname: str,
-    year_of_birth: int,
-    password: str,
-    secret_question: str,
-    secret_answer: str,
+    email: str, 
+    first_name: str, 
+    surname: str, 
+    year_of_birth: int, 
+    password: str, 
+    secret_question: str, 
+    secret_answer: str
 ) -> tuple[bool, str]:
     """
-    Register a new user.
-    Returns (True, user_id) on success or (False, error_message) on failure.
+    Registers a new user in the dual-key database architecture, hashing credentials securely.
 
-    NOTE: passwords are stored as plain text here intentionally for teaching
-    purposes. In production, replace with a salted hash (e.g. bcrypt).
+    Args:
+        email (str): User's email address (must be unique).
+        first_name (str): User's first name.
+        surname (str): User's surname.
+        year_of_birth (int): User's birth year.
+        password (str): Plain text password to be hashed.
+        secret_question (str): Security question for password recovery.
+        secret_answer (str): Plain text answer to the security question.
+
+    Returns:
+        tuple[bool, str]: A boolean indicating success, and a message string.
     """
-    raise NotImplementedError("TODO: implement after designing your schema")
+    try:
+        # Dual-Key Architecture: Generate an external-facing Business Key (user_code)
+        # while the database internally utilizes UUIDv7 for the Primary Key.
+        user_code = f"USER-{uuid.uuid4().hex[:8].upper()}"
+        full_name = f"{first_name} {surname}".strip()
+        
+        # Security Implementation: Dynamically hash passwords and secret answers using Argon2id.
+        # This memory-hard algorithm embeds the salt directly into the hash string.
+        pwd_hash = ph.hash(password)
+        ans_hash = ph.hash(secret_answer)
+
+        with _connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # Parameterized Query (%s) is used here to strictly prevent SQL Injection.
+                # RETURNING id is used to fetch the auto-generated UUIDv7 efficiently.
+                cur.execute("""
+                    INSERT INTO users (user_code, full_name, first_name, surname, email, year_of_birth)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (user_code, full_name, first_name, surname, email, year_of_birth))
+                
+                result = cur.fetchone()
+                if not result:
+                    return False, "Failed to create user record."
+                
+                user_id = result["id"]
+
+                # Relational Design: Insert credentials mapping back to the parent user 
+                # using the retrieved UUIDv7 to maintain referential integrity.
+                cur.execute("""
+                    INSERT INTO user_credentials (user_id, password_hash, secret_question, secret_answer_hash)
+                    VALUES (%s, %s, %s, %s)
+                """, (user_id, pwd_hash, secret_question, ans_hash))
+                
+        return True, "User registered successfully."
+        
+    except psycopg2.IntegrityError:
+        # Graceful Error Handling: Catch UNIQUE constraint violations (e.g., duplicate emails)
+        # to prevent application crashes and provide user-friendly feedback.
+        return False, "Email address is already registered."
+    except Exception as e:
+        logging.error(f"Database error in register_user: {e}")
+        return False, "An internal error occurred during registration."
 
 
 def login_user(email: str, password: str) -> Optional[dict]:
     """
-    Verify credentials. Returns a user dict on success or None on failure.
-    Dict keys: user_id, email, full_name, first_name, surname, phone, date_of_birth, is_active.
+    Authenticates a user via email and password using Argon2id.
+
+    Args:
+        email (str): User's email address.
+        password (str): Plain text password provided by the user.
+
+    Returns:
+        Optional[dict]: The user's profile dict if authentication succeeds, None otherwise.
     """
-    raise NotImplementedError("TODO: implement after designing your schema")
+    try:
+        with _connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT u.id, u.user_code, u.full_name, u.email, u.is_active, c.password_hash
+                    FROM users u
+                    JOIN user_credentials c ON u.id = c.user_id
+                    WHERE u.email = %s
+                """, (email,))
+                
+                user = cur.fetchone()
+
+                # Validation 1: Ensure the user record exists.
+                if not user:
+                    return None
+                
+                # Validation 2: Enforce Soft Delete Strategy. 
+                # Strictly prevent deactivated/deleted users from accessing the system.
+                if not user["is_active"]:
+                    logging.warning(f"Login blocked for deactivated user: {email}")
+                    return None
+
+                # Security Implementation: Verify the provided password against the Argon2id hash.
+                try:
+                    ph.verify(user["password_hash"], password)
+                    
+                    # Security Precaution: Strip the sensitive hash from the dictionary 
+                    # before returning it to the frontend or LLM Agent to prevent data leakage.
+                    del user["password_hash"]
+                    return dict(user)
+                    
+                except VerifyMismatchError:
+                    # Authentication failed due to incorrect password.
+                    return None
+
+    except Exception as e:
+        # Exception Handling: Log the raw DB error for debugging but return a safe fallback.
+        logging.error(f"Database error in login_user: {e}")
+        return None
 
 
 def get_user_secret_question(email: str) -> Optional[str]:
-    """Return the secret question for a registered email, or None if not found."""
-    raise NotImplementedError("TODO: implement after designing your schema")
+    """
+    Retrieves the security question for a given active user.
+
+    Args:
+        email (str): User's email address.
+
+    Returns:
+        Optional[str]: The secret question string if found, None otherwise.
+    """
+    try:
+        with _connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # Note: u.is_active = TRUE enforces the Soft Delete policy during retrieval.
+                cur.execute("""
+                    SELECT c.secret_question
+                    FROM users u
+                    JOIN user_credentials c ON u.id = c.user_id
+                    WHERE u.email = %s AND u.is_active = TRUE
+                """, (email,))
+                
+                row = cur.fetchone()
+                if row:
+                    return row["secret_question"]
+                return None
+                
+    except Exception as e:
+        logging.error(f"Database error in get_user_secret_question: {e}")
+        return None
 
 
 def verify_secret_answer(email: str, answer: str) -> bool:
-    """Return True if the provided answer matches the stored secret answer (case-insensitive)."""
-    raise NotImplementedError("TODO: implement after designing your schema")
+    """
+    Verifies the user's answer to their secret question using Argon2id.
+
+    Args:
+        email (str): User's email address.
+        answer (str): Plain text answer provided by the user.
+
+    Returns:
+        bool: True if the answer is correct, False otherwise.
+    """
+    try:
+        with _connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT c.secret_answer_hash
+                    FROM users u
+                    JOIN user_credentials c ON u.id = c.user_id
+                    WHERE u.email = %s AND u.is_active = TRUE
+                """, (email,))
+                
+                row = cur.fetchone()
+                if not row or not row["secret_answer_hash"]:
+                    return False
+                
+                # Use Argon2id verification for the secret answer, identical to password verification.
+                try:
+                    ph.verify(row["secret_answer_hash"], answer)
+                    return True
+                except VerifyMismatchError:
+                    return False
+                    
+    except Exception as e:
+        logging.error(f"Database error in verify_secret_answer: {e}")
+        return False
 
 
 def update_password(email: str, new_password: str) -> bool:
-    """Update the password for a user. Returns True if the row was updated."""
-    raise NotImplementedError("TODO: implement after designing your schema")
+    """
+    Updates a user's password securely after a successful reset verification.
+
+    Args:
+        email (str): User's email address.
+        new_password (str): The new plain text password to be hashed and stored.
+
+    Returns:
+        bool: True if the password was successfully updated, False otherwise.
+    """
+    try:
+        # Re-hash the new password using Argon2id before storing it.
+        new_pwd_hash = ph.hash(new_password)
+        
+        with _connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                # Enforce Soft Delete policy: Only active users (is_active = TRUE) 
+                # are permitted to perform password updates.
+                cur.execute("""
+                    UPDATE user_credentials c
+                    SET password_hash = %s
+                    FROM users u
+                    WHERE c.user_id = u.id 
+                      AND u.email = %s 
+                      AND u.is_active = TRUE
+                    RETURNING c.user_id
+                """, (new_pwd_hash, email))
+                
+                row = cur.fetchone()
+                return row is not None
+                
+    except Exception as e:
+        logging.error(f"Database error in update_password: {e}")
+        return False
 
 
 # ── VECTOR / RAG QUERIES — do not modify ─────────────────────────────────────
