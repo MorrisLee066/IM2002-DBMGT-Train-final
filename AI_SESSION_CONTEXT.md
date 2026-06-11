@@ -42,154 +42,180 @@ TransitFlow is a Python-based AI chat assistant for a fictional transit operator
           result = session.run("MATCH ...", station_id=station_id)
           return [dict(record) for record in result]
   ```
+- **Error Handling (Try-Catch):** All database operations and API endpoints must be wrapped in `try...except` blocks. Never allow a raw database exception to crash the application. Log the error and return a safe fallback value (e.g., `None` or `{}`).
+- **Edge Cases & Math Constraints:** Handle division-by-zero explicitly. Validate inputs (e.g., check if a list is empty before accessing `[0]`).
+- **Idempotency & Upserts:** All data seeding and write operations must use `ON CONFLICT DO NOTHING` or explicit `UPSERT` logic to ensure scripts can be run multiple times safely.
 
 ## Agreed Relational Schema
-
-<!-- ============================================================
-  FILL THIS IN after your team completes the schema design workshop.
-  Paste your final CREATE TABLE statements here.
-  ============================================================ -->
-
 ```sql
--- TODO: paste your final schema.sql contents here after team review
--- ============================================================================
--- TransitFlow PostgreSQL Schema (v3.1 Hybrid PK Final Version)
--- Optimized for: Evaluation Rubric, Python Implementation Ease, Performance
--- ============================================================================
+-- ============================================================
+--  TransitFlow PostgreSQL Schema
+--  Seed data is loaded separately by: python skeleton/seed_postgres.py
+--
+--  TWO ROLES:
+--    1. Relational - dual-network transit data
+--    2. Vector     - policy documents for RAG
+-- ============================================================
 
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE EXTENSION IF NOT EXISTS vector;
+-- Ensure UUID generation is available
+CREATE EXTENSION IF NOT EXISTS "pgcrypto"; 
 
--- ----------------------------------------------------------------------------
--- 0. 高效能密碼級 UUIDv7 產生器函數
--- (滿足老師上課對 UUIDv7 的要求，應用於高頻交易表如 bookings, payments)
--- ----------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION generate_uuid_v7() RETURNS UUID AS $$
+-- ============================================================
+--  UUIDv7 Generator Function
+-- ============================================================
+CREATE OR REPLACE FUNCTION generate_uuid_v7()
+RETURNS uuid
+AS $$
 DECLARE
-    timestamp_ms BIGINT;
-    timestamp_hex TEXT;
-    random_hex TEXT;
-    uuid_str TEXT;
+    v_time timestamp with time zone := null;
+    v_secs bigint := null;
+    v_msec bigint := null;
+    v_usec bigint := null;
+    v_unix bigint := null;
+    v_uuid bytea;
+    v_pad bytea;
 BEGIN
-    timestamp_ms := FLOOR(EXTRACT(EPOCH FROM CLOCK_TIMESTAMP()) * 1000)::BIGINT;
-    timestamp_hex := LPAD(TO_HEX(timestamp_ms), 12, '0');
-    random_hex := MD5(RANDOM()::TEXT || CLOCK_TIMESTAMP()::TEXT);
-    uuid_str := SUBSTRING(timestamp_hex FROM 1 FOR 8) || '-' ||
-                SUBSTRING(timestamp_hex FROM 9 FOR 4) || '-' ||
-                '7' || SUBSTRING(random_hex FROM 13 FOR 3) || '-' ||
-                CASE 
-                    WHEN SUBSTRING(random_hex FROM 17 FOR 1) IN ('0','1','2','3','4','5','6','7') THEN '8'
-                    WHEN SUBSTRING(random_hex FROM 17 FOR 1) IN ('8','9','a','b') THEN '9'
-                    WHEN SUBSTRING(random_hex FROM 17 FOR 1) IN ('c','d','e','f') THEN 'a'
-                    ELSE 'b'
-                END || SUBSTRING(random_hex FROM 18 FOR 3) || '-' ||
-                SUBSTRING(random_hex FROM 21 FOR 12);
-    RETURN uuid_str::UUID;
+    v_time := clock_timestamp();
+    v_secs := EXTRACT(EPOCH FROM v_time);
+    v_msec := mod(EXTRACT(MILLISECONDS FROM v_time)::numeric, 1000::numeric)::bigint;
+    v_usec := mod(EXTRACT(MICROSECONDS FROM v_time)::numeric, 1000::numeric)::bigint;
+    v_unix := (v_secs * 1000) + v_msec;
+    v_uuid := decode(lpad(to_hex(v_unix), 12, '0'), 'hex');
+    v_pad := gen_random_bytes(10);
+    v_uuid := v_uuid || v_pad;
+    v_uuid := set_byte(v_uuid, 6, (b'01110000'::bit(8) | (get_byte(v_uuid, 6)::bit(8) & b'00001111'::bit(8)))::integer);
+    v_uuid := set_byte(v_uuid, 8, (b'10000000'::bit(8) | (get_byte(v_uuid, 8)::bit(8) & b'00111111'::bit(8)))::integer);
+    RETURN encode(v_uuid, 'hex')::uuid;
 END;
 $$ LANGUAGE plpgsql VOLATILE;
 
 -- ----------------------------------------------------------------------------
--- 1. 全域列舉型別 (Enums)
+-- 1. Enumerated types
 -- ----------------------------------------------------------------------------
-CREATE TYPE direction_enum AS ENUM ('northbound', 'southbound');
+CREATE TYPE direction_enum AS ENUM ('northbound', 'southbound', 'eastbound', 'westbound');
 CREATE TYPE service_type_enum AS ENUM ('normal', 'express');
 CREATE TYPE ticket_type_enum AS ENUM ('single', 'return', 'day_pass');
 CREATE TYPE fare_class_enum AS ENUM ('standard', 'first');
 CREATE TYPE booking_status_enum AS ENUM ('confirmed', 'in_transit', 'completed', 'cancelled');
-CREATE TYPE payment_method_enum AS ENUM ('credit_card', 'ewallet');
+CREATE TYPE payment_method_enum AS ENUM ('credit_card', 'debit_card', 'ewallet');
 CREATE TYPE payment_status_enum AS ENUM ('paid', 'refunded', 'failed');
 
 -- ----------------------------------------------------------------------------
--- 2. 使用者與安全資安模組
+-- 2. Users and credentials
 -- ----------------------------------------------------------------------------
 CREATE TABLE users (
-    user_id       VARCHAR(50) PRIMARY KEY, -- 為了 Python 寫入友善，保留 RU01
+    -- PK Justification: Chosen UUID for external-facing entities to prevent enumeration attacks 
+    -- and support future distributed microservice scaling.
+    id            UUID PRIMARY KEY DEFAULT generate_uuid_v7(),
+    
+    -- Business Key: Retained mock data ID (e.g., RU01) as a UNIQUE constraint for system mapping.
+    user_code     VARCHAR(50) UNIQUE NOT NULL,
+    
     full_name     VARCHAR(200) NOT NULL,
-    first_name    VARCHAR(100),            -- 對齊 register_user 參數
-    surname       VARCHAR(100),            -- 對齊 register_user 參數
+    first_name    VARCHAR(100),
+    surname       VARCHAR(100),
     email         VARCHAR(255) UNIQUE NOT NULL,
     phone         VARCHAR(30),
-    date_of_birth DATE,                    
-    year_of_birth INTEGER,                 -- 對齊 register_user 參數
-    is_active     BOOLEAN NOT NULL DEFAULT TRUE, -- Soft delete
+    date_of_birth DATE,
+    year_of_birth INTEGER,
+    -- Delete Strategy: Soft delete (is_active) is chosen to preserve historical bookings, 
+    -- trips, and accounting records (payments) while safely marking the user as deactivated.
+    is_active     BOOLEAN NOT NULL DEFAULT TRUE,
     registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE user_credentials (
-    user_id            VARCHAR(50) PRIMARY KEY,
+    -- PK Justification: 1:1 relationship with users. UUID matches the parent table.
+    user_id            UUID PRIMARY KEY,
+    
+    -- Security Justification: Using Argon2id. Salt is embedded directly in the hash string, 
+    -- eliminating the need for a separate stored_salt column.
     password_hash      VARCHAR(255) NOT NULL,
     secret_question    VARCHAR(255),
     secret_answer_hash VARCHAR(255),
-    CONSTRAINT fk_credentials_user 
-        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    -- FK Cascade Strategy: CASCADE is used because credentials have no independent 
+    -- business value without the parent user row.
+    CONSTRAINT fk_credentials_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
 -- ----------------------------------------------------------------------------
--- 3. 基礎設施模組 (車站與路線)
+-- 3. Stations and lines
 -- ----------------------------------------------------------------------------
 CREATE TABLE metro_stations (
-    station_id                   VARCHAR(50) PRIMARY KEY, -- e.g., MS01
+    -- PK Justification: Chosen SERIAL for infrastructure lookup tables. Data is static, 
+    -- centrally managed, and Integer JOINs provide optimal B-Tree indexing performance.
+    id                           SERIAL PRIMARY KEY,
+    station_code                 VARCHAR(50) UNIQUE NOT NULL,
     name                         VARCHAR(100) NOT NULL,
     is_interchange_metro         BOOLEAN NOT NULL DEFAULT FALSE,
     is_interchange_national_rail BOOLEAN NOT NULL DEFAULT FALSE,
-    interchange_nr_id            VARCHAR(50)
+    interchange_nr_id            INTEGER -- Will be linked via FK later
 );
 
 CREATE TABLE national_rail_stations (
-    station_id                   VARCHAR(50) PRIMARY KEY, -- e.g., NR01
+    id                           SERIAL PRIMARY KEY,
+    station_code                 VARCHAR(50) UNIQUE NOT NULL,
     name                         VARCHAR(100) NOT NULL,
     is_interchange_national_rail BOOLEAN NOT NULL DEFAULT FALSE,
     is_interchange_metro         BOOLEAN NOT NULL DEFAULT FALSE,
-    interchange_metro_id         VARCHAR(50),
-    CONSTRAINT fk_rail_interchange_metro 
-        FOREIGN KEY (interchange_metro_id) REFERENCES metro_stations(station_id) ON DELETE SET NULL
+    interchange_metro_id         INTEGER,
+    -- FK Cascade Strategy: SET NULL allows the station to remain operational 
+    -- even if its connected interchange station is permanently closed or removed.
+    CONSTRAINT fk_rail_interchange_metro FOREIGN KEY (interchange_metro_id) REFERENCES metro_stations(id) ON DELETE SET NULL
 );
 
-ALTER TABLE metro_stations 
-    ADD CONSTRAINT fk_metro_interchange_rail 
-    FOREIGN KEY (interchange_nr_id) REFERENCES national_rail_stations(station_id) ON DELETE SET NULL;
+ALTER TABLE metro_stations
+    ADD CONSTRAINT fk_metro_interchange_rail
+    FOREIGN KEY (interchange_nr_id) REFERENCES national_rail_stations(id) ON DELETE SET NULL;
 
--- 路線主檔與關聯表 (Junction Tables)
 CREATE TABLE metro_lines (
-    line_id VARCHAR(50) PRIMARY KEY -- e.g., M1
+    id        SERIAL PRIMARY KEY,
+    line_code VARCHAR(50) UNIQUE NOT NULL
 );
 
 CREATE TABLE metro_station_lines (
-    station_id VARCHAR(50) NOT NULL,
-    line_id    VARCHAR(50) NOT NULL,
+    station_id INTEGER NOT NULL,
+    line_id    INTEGER NOT NULL,
     PRIMARY KEY (station_id, line_id),
-    CONSTRAINT fk_msl_station FOREIGN KEY (station_id) REFERENCES metro_stations(station_id) ON DELETE CASCADE,
-    CONSTRAINT fk_msl_line FOREIGN KEY (line_id) REFERENCES metro_lines(line_id) ON DELETE CASCADE
+    CONSTRAINT fk_msl_station FOREIGN KEY (station_id) REFERENCES metro_stations(id) ON DELETE CASCADE,
+    CONSTRAINT fk_msl_line FOREIGN KEY (line_id) REFERENCES metro_lines(id) ON DELETE CASCADE
 );
 
 CREATE TABLE national_rail_lines (
-    line_id VARCHAR(50) PRIMARY KEY -- e.g., NR1
+    id        SERIAL PRIMARY KEY,
+    line_code VARCHAR(50) UNIQUE NOT NULL
 );
 
 CREATE TABLE national_rail_station_lines (
-    station_id VARCHAR(50) NOT NULL,
-    line_id    VARCHAR(50) NOT NULL,
+    station_id INTEGER NOT NULL,
+    line_id    INTEGER NOT NULL,
     PRIMARY KEY (station_id, line_id),
-    CONSTRAINT fk_nrsl_station FOREIGN KEY (station_id) REFERENCES national_rail_stations(station_id) ON DELETE CASCADE,
-    CONSTRAINT fk_nrsl_line FOREIGN KEY (line_id) REFERENCES national_rail_lines(line_id) ON DELETE CASCADE
+    CONSTRAINT fk_nrsl_station FOREIGN KEY (station_id) REFERENCES national_rail_stations(id) ON DELETE CASCADE,
+    CONSTRAINT fk_nrsl_line FOREIGN KEY (line_id) REFERENCES national_rail_lines(id) ON DELETE CASCADE
 );
 
 -- ----------------------------------------------------------------------------
--- 4. 班表、停靠站與費率模組
+-- 4. Schedules, stops, fares, and seats
 -- ----------------------------------------------------------------------------
 CREATE TABLE metro_schedules (
-    schedule_id       VARCHAR(50) PRIMARY KEY,
-    line_id           VARCHAR(50) NOT NULL REFERENCES metro_lines(line_id) ON DELETE RESTRICT,
+    id                SERIAL PRIMARY KEY,
+    schedule_code     VARCHAR(50) UNIQUE NOT NULL,
+    -- FK Cascade Strategy: RESTRICT prevents accidental deletion of an active metro line 
+    -- while schedules are still assigned to it.
+    line_id           INTEGER NOT NULL REFERENCES metro_lines(id) ON DELETE RESTRICT,
     direction         direction_enum NOT NULL,
     base_fare_usd     NUMERIC(10,2) NOT NULL,
     per_stop_rate_usd NUMERIC(10,2) NOT NULL,
     frequency_min     INTEGER,
-    operates_on       TEXT[] NOT NULL
+    operates_on       TEXT[] NOT NULL,
+    CONSTRAINT chk_metro_fares_non_negative CHECK (base_fare_usd >= 0 AND per_stop_rate_usd >= 0)
 );
 
 CREATE TABLE national_rail_schedules (
-    schedule_id   VARCHAR(50) PRIMARY KEY,
-    line_id       VARCHAR(50) NOT NULL REFERENCES national_rail_lines(line_id) ON DELETE RESTRICT,
+    id            SERIAL PRIMARY KEY,
+    schedule_code VARCHAR(50) UNIQUE NOT NULL,
+    line_id       INTEGER NOT NULL REFERENCES national_rail_lines(id) ON DELETE RESTRICT,
     service_type  service_type_enum NOT NULL,
     direction     direction_enum NOT NULL,
     frequency_min INTEGER,
@@ -197,62 +223,66 @@ CREATE TABLE national_rail_schedules (
 );
 
 CREATE TABLE national_rail_fares (
-    schedule_id       VARCHAR(50) NOT NULL,
+    schedule_id       INTEGER NOT NULL,
     fare_class        fare_class_enum NOT NULL,
     base_fare_usd     NUMERIC(10,2) NOT NULL,
     per_stop_rate_usd NUMERIC(10,2) NOT NULL,
     PRIMARY KEY (schedule_id, fare_class),
-    CONSTRAINT fk_fares_schedule FOREIGN KEY (schedule_id) REFERENCES national_rail_schedules(schedule_id) ON DELETE CASCADE
+    CONSTRAINT fk_fares_schedule FOREIGN KEY (schedule_id) REFERENCES national_rail_schedules(id) ON DELETE CASCADE,
+    CONSTRAINT chk_rail_fares_non_negative CHECK (base_fare_usd >= 0 AND per_stop_rate_usd >= 0)
 );
 
--- 停靠站接續表 (2NF 設計，滿足評分標準)
 CREATE TABLE metro_schedule_stops (
-    schedule_id                 VARCHAR(50) NOT NULL,
-    station_id                  VARCHAR(50) NOT NULL,
+    schedule_id                 INTEGER NOT NULL,
+    station_id                  INTEGER NOT NULL,
     stop_order                  INTEGER NOT NULL,
     travel_time_from_origin_min INTEGER NOT NULL,
     PRIMARY KEY (schedule_id, stop_order),
     UNIQUE (schedule_id, station_id),
-    CONSTRAINT fk_metro_stops_schedule FOREIGN KEY (schedule_id) REFERENCES metro_schedules(schedule_id) ON DELETE CASCADE,
-    CONSTRAINT fk_metro_stops_station FOREIGN KEY (station_id) REFERENCES metro_stations(station_id) ON DELETE RESTRICT
+    CONSTRAINT fk_metro_stops_schedule FOREIGN KEY (schedule_id) REFERENCES metro_schedules(id) ON DELETE CASCADE,
+    CONSTRAINT fk_metro_stops_station FOREIGN KEY (station_id) REFERENCES metro_stations(id) ON DELETE RESTRICT,
+    CONSTRAINT chk_metro_stop_order_positive CHECK (stop_order > 0),
+    CONSTRAINT chk_metro_travel_time_non_negative CHECK (travel_time_from_origin_min >= 0)
 );
 
 CREATE TABLE national_rail_schedule_stops (
-    schedule_id                 VARCHAR(50) NOT NULL,
-    station_id                  VARCHAR(50) NOT NULL,
+    schedule_id                 INTEGER NOT NULL,
+    station_id                  INTEGER NOT NULL,
     stop_order                  INTEGER NOT NULL,
     travel_time_from_origin_min INTEGER NOT NULL,
     PRIMARY KEY (schedule_id, stop_order),
     UNIQUE (schedule_id, station_id),
-    CONSTRAINT fk_rail_stops_schedule FOREIGN KEY (schedule_id) REFERENCES national_rail_schedules(schedule_id) ON DELETE CASCADE,
-    CONSTRAINT fk_rail_stops_station FOREIGN KEY (station_id) REFERENCES national_rail_stations(station_id) ON DELETE RESTRICT
+    CONSTRAINT fk_rail_stops_schedule FOREIGN KEY (schedule_id) REFERENCES national_rail_schedules(id) ON DELETE CASCADE,
+    CONSTRAINT fk_rail_stops_station FOREIGN KEY (station_id) REFERENCES national_rail_stations(id) ON DELETE RESTRICT,
+    CONSTRAINT chk_rail_stop_order_positive CHECK (stop_order > 0),
+    CONSTRAINT chk_rail_travel_time_non_negative CHECK (travel_time_from_origin_min >= 0)
 );
 
--- 座位表 (攤平設計 反正規化)
 CREATE TABLE national_rail_seats (
-    id          UUID PRIMARY KEY DEFAULT generate_uuid_v7(),
-    schedule_id VARCHAR(50) NOT NULL,
+    schedule_id INTEGER NOT NULL,
     seat_code   VARCHAR(50) NOT NULL,
     coach       VARCHAR(10) NOT NULL,
     fare_class  fare_class_enum NOT NULL,
     seat_row    INTEGER NOT NULL,
     seat_column VARCHAR(10) NOT NULL,
-    UNIQUE (schedule_id, seat_code),
-    CONSTRAINT fk_seats_schedule FOREIGN KEY (schedule_id) REFERENCES national_rail_schedules(schedule_id) ON DELETE CASCADE
+    PRIMARY KEY (schedule_id, seat_code),
+    CONSTRAINT fk_seats_schedule FOREIGN KEY (schedule_id) REFERENCES national_rail_schedules(id) ON DELETE CASCADE,
+    CONSTRAINT chk_seat_row_positive CHECK (seat_row > 0)
 );
 
 -- ----------------------------------------------------------------------------
--- 5. 核心交易模組 (採用 UUIDv7 提升高併發寫入效能)
+-- 5. Core transaction tables
 -- ----------------------------------------------------------------------------
 CREATE TABLE national_rail_bookings (
+    -- PK Justification: Chosen UUID for high-volume transactional data.
     id                     UUID PRIMARY KEY DEFAULT generate_uuid_v7(),
-    booking_ref            VARCHAR(50) UNIQUE NOT NULL, -- e.g., BK001
+    booking_ref            VARCHAR(50) UNIQUE NOT NULL,
     
-    user_id                VARCHAR(50) NOT NULL,
-    schedule_id            VARCHAR(50) NOT NULL,
-    origin_station_id      VARCHAR(50) NOT NULL,
-    destination_station_id VARCHAR(50) NOT NULL,
-    seat_id                UUID NOT NULL,
+    user_id                UUID NOT NULL,
+    schedule_id            INTEGER NOT NULL,
+    origin_station_id      INTEGER NOT NULL,
+    destination_station_id INTEGER NOT NULL,
+    seat_code              VARCHAR(50) NOT NULL,
     
     travel_date            DATE NOT NULL,
     departure_time         TIME NOT NULL,
@@ -260,45 +290,54 @@ CREATE TABLE national_rail_bookings (
     fare_class             fare_class_enum NOT NULL,
     coach                  VARCHAR(10) NOT NULL,
     
+    -- Design Choice (Denormalization): Cached here to avoid repeated JOINs to schedule_stops
+    -- for fast availability and route history queries.
     stops_travelled        INTEGER NOT NULL,
-    origin_stop_order      INTEGER NOT NULL, -- 區間查詢反正規化
+    origin_stop_order      INTEGER NOT NULL,
     destination_stop_order INTEGER NOT NULL,
     
+    -- Design Choice (Denormalization): amount_usd is a financial snapshot at the time of 
+    -- booking. It must remain stable and immutable even if base fares are updated later.
     amount_usd             NUMERIC(10,2) NOT NULL,
     refund_amount_usd      NUMERIC(10,2),
     status                 booking_status_enum NOT NULL DEFAULT 'confirmed',
-    
     booked_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     travelled_at           TIMESTAMPTZ,
     cancelled_at           TIMESTAMPTZ,
-    
-    CONSTRAINT fk_rail_bookings_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE RESTRICT,
-    CONSTRAINT fk_rail_bookings_schedule FOREIGN KEY (schedule_id) REFERENCES national_rail_schedules(schedule_id) ON DELETE RESTRICT,
-    CONSTRAINT fk_rail_bookings_origin FOREIGN KEY (origin_station_id) REFERENCES national_rail_stations(station_id) ON DELETE RESTRICT,
-    CONSTRAINT fk_rail_bookings_dest FOREIGN KEY (destination_station_id) REFERENCES national_rail_stations(station_id) ON DELETE RESTRICT,
-    CONSTRAINT fk_rail_bookings_seat FOREIGN KEY (seat_id) REFERENCES national_rail_seats(id) ON DELETE RESTRICT,
-    CONSTRAINT chk_booking_direction CHECK (destination_stop_order > origin_stop_order)
+
+    CONSTRAINT fk_rail_bookings_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT,
+    CONSTRAINT fk_rail_bookings_schedule FOREIGN KEY (schedule_id) REFERENCES national_rail_schedules(id) ON DELETE RESTRICT,
+    CONSTRAINT fk_rail_bookings_origin FOREIGN KEY (origin_station_id) REFERENCES national_rail_stations(id) ON DELETE RESTRICT,
+    CONSTRAINT fk_rail_bookings_dest FOREIGN KEY (destination_station_id) REFERENCES national_rail_stations(id) ON DELETE RESTRICT,
+    CONSTRAINT fk_rail_bookings_seat FOREIGN KEY (schedule_id, seat_code) REFERENCES national_rail_seats(schedule_id, seat_code) ON DELETE RESTRICT,
+    CONSTRAINT chk_booking_direction CHECK (destination_stop_order > origin_stop_order),
+    CONSTRAINT chk_booking_stops_positive CHECK (stops_travelled > 0),
+    CONSTRAINT chk_booking_amount_non_negative CHECK (amount_usd >= 0)
 );
 
 CREATE TABLE metro_trips (
     id                     UUID PRIMARY KEY DEFAULT generate_uuid_v7(),
     trip_ref               VARCHAR(50) UNIQUE NOT NULL,
-    user_id                VARCHAR(50) NOT NULL,
-    schedule_id            VARCHAR(50) REFERENCES metro_schedules(schedule_id) ON DELETE RESTRICT,
-    origin_station_id      VARCHAR(50) REFERENCES metro_stations(station_id) ON DELETE RESTRICT,
-    destination_station_id VARCHAR(50) REFERENCES metro_stations(station_id) ON DELETE RESTRICT,
+    user_id                UUID NOT NULL,
+    schedule_id            INTEGER REFERENCES metro_schedules(id) ON DELETE RESTRICT,
+    origin_station_id      INTEGER REFERENCES metro_stations(id) ON DELETE RESTRICT,
+    destination_station_id INTEGER REFERENCES metro_stations(id) ON DELETE RESTRICT,
     travel_date            DATE NOT NULL,
     ticket_type            ticket_type_enum NOT NULL,
-    day_pass_ref           UUID REFERENCES metro_trips(id) ON DELETE SET NULL,
+    day_pass_id            UUID REFERENCES metro_trips(id) ON DELETE SET NULL,
     stops_travelled        INTEGER,
     amount_usd             NUMERIC(10,2) NOT NULL,
     status                 booking_status_enum NOT NULL DEFAULT 'in_transit',
-    purchased_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    purchased_at           TIMESTAMPTZ,
     travelled_at           TIMESTAMPTZ,
-    CONSTRAINT fk_metro_trips_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE RESTRICT
+
+    CONSTRAINT fk_metro_trips_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT,
+    CONSTRAINT chk_metro_trip_amount_non_negative CHECK (amount_usd >= 0)
 );
 
--- 多型關聯付款表
+-- ----------------------------------------------------------------------------
+-- 6. Payments and feedback
+-- ----------------------------------------------------------------------------
 CREATE TABLE payments (
     id              UUID PRIMARY KEY DEFAULT generate_uuid_v7(),
     payment_ref     VARCHAR(50) UNIQUE NOT NULL,
@@ -308,22 +347,26 @@ CREATE TABLE payments (
     method          payment_method_enum NOT NULL,
     status          payment_status_enum NOT NULL DEFAULT 'paid',
     paid_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    
+    -- Design Choice (Polymorphic Association): Enforces that a payment belongs to 
+    -- EXACTLY ONE type of transaction (either rail or metro, but not both or neither).
     CONSTRAINT chk_payment_polymorphic CHECK (
         (rail_booking_id IS NOT NULL AND metro_trip_id IS NULL) OR
         (rail_booking_id IS NULL AND metro_trip_id IS NOT NULL)
-    )
+    ),
+    CONSTRAINT chk_payment_amount_non_negative CHECK (amount_usd >= 0)
 );
 
 CREATE TABLE feedback (
     id              UUID PRIMARY KEY DEFAULT generate_uuid_v7(),
     feedback_ref    VARCHAR(50) UNIQUE NOT NULL,
-    user_id         VARCHAR(50) NOT NULL,
+    user_id         UUID NOT NULL,
     rail_booking_id UUID REFERENCES national_rail_bookings(id) ON DELETE CASCADE,
     metro_trip_id   UUID REFERENCES metro_trips(id) ON DELETE CASCADE,
     rating          INTEGER NOT NULL,
     comment         TEXT,
     submitted_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT fk_feedback_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    CONSTRAINT fk_feedback_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     CONSTRAINT chk_feedback_rating_range CHECK (rating >= 1 AND rating <= 5),
     CONSTRAINT chk_feedback_polymorphic CHECK (
         (rail_booking_id IS NOT NULL AND metro_trip_id IS NULL) OR
@@ -331,24 +374,35 @@ CREATE TABLE feedback (
     )
 );
 
--- 索引優化
-CREATE INDEX idx_fk_rail_bookings_user ON national_rail_bookings(user_id);
-CREATE INDEX idx_fk_metro_trips_user ON metro_trips(user_id);
-CREATE INDEX idx_fk_payments_paid_at ON payments(paid_at);
+-- ----------------------------------------------------------------------------
+-- 7. Indexes
+-- ----------------------------------------------------------------------------
+CREATE INDEX idx_rail_bookings_user ON national_rail_bookings(user_id);
+CREATE INDEX idx_metro_trips_user ON metro_trips(user_id);
+CREATE INDEX idx_payments_paid_at ON payments(paid_at);
 
 -- ============================================================
--- VECTOR SCHEMA (Do not modify)
+--  VECTOR SCHEMA  (RAG / Help Desk) — do not modify
 -- ============================================================
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
 CREATE TABLE IF NOT EXISTS policy_documents (
     id          SERIAL       PRIMARY KEY,
     title       VARCHAR(200) NOT NULL,
-    category    VARCHAR(50)  NOT NULL, 
+    category    VARCHAR(50)  NOT NULL,  -- 'refund', 'booking', 'conduct'
     content     TEXT         NOT NULL,
+    -- 768-dim  → Ollama nomic-embed-text (default)
+    -- 3072-dim → Gemini gemini-embedding-001
+    -- If you switch LLM_PROVIDER to gemini, change to vector(3072) and reset the database.
     embedding   vector(768),
     source_file VARCHAR(200),
     created_at  TIMESTAMPTZ  DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS ON policy_documents USING hnsw (embedding vector_cosine_ops);
+
+CREATE INDEX IF NOT EXISTS policy_documents_embedding_idx
+ON policy_documents
+USING hnsw (embedding vector_cosine_ops);
 ```
 
 ## Agreed Graph Schema
@@ -359,33 +413,31 @@ CREATE INDEX IF NOT EXISTS ON policy_documents USING hnsw (embedding vector_cosi
   ============================================================ -->
 
 ```
-哈囉！我是「資料庫」。根據你上傳的 `seed_neo4j.py` 實作細節以及我們先前對於「圖形與關聯分離」與修正權重陷阱的討論，我已經幫你把 `AI_SESSION_CONTEXT.md` 裡面遺漏的 Graph Schema 規劃整理好了。
+Node labels:
 
-你可以直接將以下內容複製，並完全取代掉文件中的 TODO 區塊：
+MetroStation: 捷運車站節點。
 
----
+NationalRailStation: 國鐵/台鐵車站節點。
 
-**Node labels:**
+Relationship types:
 
-* `MetroStation`: 捷運車站節點。
-* `NationalRailStation`: 國鐵/台鐵車站節點。
+METRO_LINK: 連結相鄰的捷運車站（MetroStation 之間）。
 
-**Relationship types:**
+RAIL_LINK: 連結相鄰的國鐵車站（NationalRailStation 之間）。
 
-* `METRO_LINK`: 連結相鄰的捷運車站（MetroStation 之間）。
-* `RAIL_LINK`: 連結相鄰的國鐵車站（NationalRailStation 之間）。
-* `INTERCHANGE_WITH`: 跨網路雙向轉乘連線（MetroStation 與 NationalRailStation 之間）。
+INTERCHANGE_WITH: 跨網路雙向轉乘連線（MetroStation 與 NationalRailStation 之間）。
 
-**Key properties:**
+Key properties:
 
-* `MetroStation` (Nodes): `station_id`, `name`, `lines`, `is_interchange_nr`, `interchange_nr_id`
-* `NationalRailStation` (Nodes): `station_id`, `name`, `lines`, `is_interchange_m`, `interchange_m_id`
-* 
-`METRO_LINK` & `RAIL_LINK` (Relationships): `line`, `travel_time_min`, `fare`, `fare_first` 
+MetroStation (Nodes): station_id, name, lines, is_interchange_nr, interchange_nr_id
+
+NationalRailStation (Nodes): station_id, name, lines, is_interchange_m, interchange_m_id
 
 
-* 
-`INTERCHANGE_WITH` (Relationships): `travel_time_min` (預設 5 分鐘), `fare` (預設 0.0), `fare_first` (預設 0.0)
+METRO_LINK & RAIL_LINK (Relationships): line, travel_time_min, fare, fare_first 
+
+
+INTERCHANGE_WITH (Relationships): travel_time_min (預設 5 分鐘), fare (預設 0.0), fare_first (預設 0.0)
 ```
 
 ## Function Signatures We Are Implementing
@@ -432,9 +484,10 @@ def query_station_connections(station_id: str) -> list[dict]: ...
 
 <!-- Add entries as you make decisions. Format: "Decision: X. Why: Y." -->
 
-- [ ] Schema design: TODO — add your table/column decisions here
-- [ ] Graph schema: TODO — add your node label and relationship type decisions here
-- [ ] (example) Metro schedule stop ordering: using `jsonb_array_elements` approach — easier to debug than containment operators
+- [x] Schema design: Refactored to a Dual-Key Architecture. Replaced VARCHAR PKs with Surrogate Keys (UUID for transactional/external entities, SERIAL for static/infrastructure entities) to improve indexing, JOIN performance, and security. Retained VARCHAR mock IDs as UNIQUE business keys for seamless data seeding. Added explicit inline comments justifying PK, Soft Delete, and FK Cascade strategies for grading compliance.
+- [x] UUID Index Optimization: Implemented a custom PL/pgSQL function to generate UUIDv7 (time-ordered) instead of the default UUIDv4 (`gen_random_uuid()`). This prevents B-Tree index fragmentation and significantly improves write performance for high-volume transactional tables (`users`, `national_rail_bookings`, `metro_trips`, `payments`, `feedback`).
+- [x] Execution Context: Discovered that default `agent.py` lacks `departure_time` in booking logic. Based on TA advice, we decided to ENHANCE `agent.py` and our queries to fully support timetable logic based on `frequency_min`. This will be documented as a Task 6 Bonus feature.
+- [x] Security Implementation: Initially considered switching to PBKDF2 to avoid external dependencies. However, to align with the TA's specific lecture on Argon2id (v19, memory-hard hashing) and achieve maximum score in Section 2, we deliberately added `argon2-cffi` to `requirements.txt` and embedded the hashing logic securely in the seeding script.
 
 ## Prompts That Worked
 
